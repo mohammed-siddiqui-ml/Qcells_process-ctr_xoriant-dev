@@ -1,4 +1,3 @@
-
 # CTR Processing Lambda Function (merged)
 # --------------------------------------
 # - Reads a call summary from DynamoDB (ConnectCallTimeline) by RootContactId
@@ -32,8 +31,15 @@ from common.sf_auth import get_access_token
 # ---- AWS resources ----
 DDB = boto3.resource("dynamodb")
 TABLE = DDB.Table(os.environ.get("TIMELINE_TABLE", "ConnectCallTimeline"))
-SALESFORCE_TASK_BASE_URL = os.environ.get("SALES_FORCE_TASK_BASE_URL", "https://qcellsnorthamerica123--qa.sandbox.lightning.force.com/lightning/r/Task/")
-SALESFORCE_S3_PRESIGNED_BASE_URL = os.environ.get("SALESFORCE_S3_PRESIGNED_URL", "https://qcellsnorthamerica123--qa.sandbox.my.salesforce-setup.com/apex/S3Redirect?")
+
+SALESFORCE_TASK_BASE_URL = os.environ.get(
+    "SALES_FORCE_TASK_BASE_URL",
+    "https://qcellsnorthamerica123--qa.sandbox.lightning.force.com/lightning/r/Task/"
+)
+SALESFORCE_S3_PRESIGNED_BASE_URL = os.environ.get(
+    "SALESFORCE_S3_PRESIGNED_URL",
+    "https://qcellsnorthamerica123--qa.sandbox.my.salesforce-setup.com/apex/S3Redirect?"
+)
 
 _deser = TypeDeserializer()
 
@@ -42,7 +48,6 @@ _deser = TypeDeserializer()
 # -----------------------------
 
 def iso_to_dt(s: Optional[str]) -> Optional[datetime]:
-    """Parse ISO-8601 Z timestamps into aware UTC datetime."""
     if not s or not isinstance(s, str):
         return None
     if s.endswith("Z"):
@@ -77,7 +82,6 @@ def safe_get(d: Dict[str, Any], *path, default=None):
     return cur
 
 def fmt_time_local(dt: datetime, tz: ZoneInfo, show_utc: bool) -> str:
-    """Render 'HH:MM:SS' in local tz; optionally append ' (HH:MM:SSZ)'."""
     if not isinstance(dt, datetime):
         return ""
     lt = dt.astimezone(tz)
@@ -119,29 +123,34 @@ def build_timeline_payload(item: Dict[str, Any]) -> Dict[str, Any]:
     """
 
     # Output formatting config
-    tz_name  = os.environ.get("OUTPUT_TZ", "Asia/Kolkata")
+
+    tz_name = os.environ.get("OUTPUT_TZ", "Asia/Kolkata")
     show_utc = os.environ.get("SHOW_UTC", "false").lower() in ("1", "true", "yes")
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = ZoneInfo("UTC")
 
-    # Core fields
-    root_id: str                 = item.get("RootContactId")
-    case_id: Optional[str]       = item.get("CaseId")
-    call_started: Optional[str]  = item.get("CallStartedTs")
-    call_ended: Optional[str]    = item.get("CallEndedTs")
+    root_id: str    = item.get("RootContactId")
+    call_started    = item.get("CallStartedTs")
+    call_ended      = item.get("CallEndedTs")
 
-    legs: Dict[str, Dict[str, Any]]   = item.get("ContactLegs", {}) or {}
-    agents: Dict[str, Dict[str, Any]] = item.get("Agents", {}) or {}
+    legs = item.get("ContactLegs", {}) or {}
+    agents = item.get("Agents", {}) or {}
 
-    root_leg                     = legs.get(root_id, {}) or {}
-    customer_endpoint            = root_leg.get("CustomerEndpoint")
-    initial_queue                = root_leg.get("QueueName")
-    root_disconnect_reason       = root_leg.get("DisconnectReason")
-    root_disconnect_ts           = root_leg.get("DisconnectTimestamp")
-    inbound_agent                = root_leg.get("AgentUsername")
-    inbound_transfer_ts          = iso_to_dt(root_leg.get("TransferCompletedTimestamp"))
+    #Collect CaseIds from agents
+    case_ids: List[str] = []
+    for _, agent in agents.items():
+        cid = agent.get("CaseId")
+        if cid and cid not in case_ids:
+            case_ids.append(cid)
+
+    root_leg = legs.get(root_id, {}) or {}
+    customer_endpoint = root_leg.get("CustomerEndpoint")
+    initial_queue = root_leg.get("QueueName")
+    root_disconnect_reason = root_leg.get("DisconnectReason")
+    inbound_agent = root_leg.get("AgentUsername")
+    inbound_transfer_ts = iso_to_dt(root_leg.get("TransferCompletedTimestamp"))
 
     # Earliest agent to join (for “answered” phrasing)
     first_agent, first_join_dt = None, None
@@ -159,6 +168,7 @@ def build_timeline_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         ia_first = iso_to_dt(safe_get(agents, inbound_agent, "firstJoin")) or iso_to_dt(call_started)
         if ia_first:
             chain.append((inbound_agent, ia_first))
+
     for _, lg in transfer_legs:
         dst = lg.get("AgentUsername")
         if not dst:
@@ -166,6 +176,7 @@ def build_timeline_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         jdt = iso_to_dt(safe_get(agents, dst, "firstJoin"))
         if jdt:
             chain.append((dst, jdt))
+
     chain.sort(key=lambda x: x[1])
 
     transfer_chain = []
@@ -173,30 +184,9 @@ def build_timeline_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         src = chain[i-1][0]
         dst = chain[i][0]
         when = inbound_transfer_ts if (i == 1 and inbound_transfer_ts) else chain[i][1]
-        transfer_chain.append({"from": src, "to": dst, "at": dt_to_iso(when) if when else None})
+        transfer_chain.append({"from": src, "to": dst, "at": dt_to_iso(when)})
 
-    # Who ended (prefer transfer leg reason if ts matches call end)
-    call_ended_dt = iso_to_dt(call_ended)
-    end_reason = root_disconnect_reason
-    if call_ended_dt and transfer_legs:
-        for _, lg in transfer_legs:
-            lg_dt = iso_to_dt(lg.get("DisconnectTimestamp"))
-            if lg_dt and abs((lg_dt - call_ended_dt).total_seconds()) < 0.5:
-                if lg.get("DisconnectReason"):
-                    end_reason = lg.get("DisconnectReason")
-                    break
-
-    # Recording URLs (unique across legs)
-    recording_urls: List[str] = []
-    for _, lg in legs.items():
-        url = lg.get("RecordingUrl")
-        if isinstance(url, str) and url and url not in recording_urls:
-            recording_urls.append(url)
-
-    # -------------------------
-    # Build structured events
-    # -------------------------
-    events: List[Dict[str, Any]] = []
+    events = []
 
     if call_started:
         events.append({"type": "CALL_STARTED", "ts": call_started})
@@ -206,134 +196,80 @@ def build_timeline_payload(item: Dict[str, Any]) -> Dict[str, Any]:
             events.append({"type": "AGENT_JOINED", "ts": info["firstJoin"], "agent": a})
 
     for t in transfer_chain:
-        if t.get("at"):
-            events.append({"type": "TRANSFER_COMPLETED", "ts": t["at"], "from": t["from"], "to": t["to"]})
+        events.append({"type": "TRANSFER_COMPLETED", "ts": t["at"], "from": t["from"], "to": t["to"]})
 
     for a, info in agents.items():
         if info.get("lastLeave"):
-            # enrich with reason if leg matches
-            leg_reason = None
-            for _, lg in legs.items():
-                if lg.get("AgentUsername") == a and lg.get("DisconnectTimestamp") == info["lastLeave"]:
-                    leg_reason = lg.get("DisconnectReason"); break
-            ev = {"type": "AGENT_LEFT", "ts": info["lastLeave"], "agent": a}
-            if leg_reason:
-                ev["reason"] = leg_reason
-            events.append(ev)
+            events.append({"type": "AGENT_LEFT", "ts": info["lastLeave"], "agent": a})
 
     if call_ended:
-        ev = {"type": "CALL_ENDED", "ts": call_ended}
-        if end_reason:
-            ev["reason"] = end_reason
-        events.append(ev)
+        events.append({"type": "CALL_ENDED", "ts": call_ended, "reason": root_disconnect_reason})
 
-    # Sort ascending by time; tie-break with event priority
-    def _key(ev: Dict[str, Any]):
-        dt = iso_to_dt(ev.get("ts"))
-        order = _EVENT_ORDER.get(ev.get("type"), 999)
-        return (dt or datetime.max.replace(tzinfo=timezone.utc), order, ev.get("type"))
-    events.sort(key=_key)
+    events.sort(key=lambda ev: (
+        iso_to_dt(ev.get("ts")) or datetime.max.replace(tzinfo=timezone.utc),
+        _EVENT_ORDER.get(ev.get("type"), 999)
+    ))
 
-    # -------------------------
-    # Human-readable timeline (format you asked)
-    # -------------------------
-    def render_line(ev: Dict[str, Any]) -> Optional[str]:
-        ts_dt = iso_to_dt(ev.get("ts"))
-        if not ts_dt:
-            return None
-        stamp = dt_to_iso(ts_dt)
-        t = ev.get("type")
+    text_lines = ["Call Summary:\n"]
 
-        if t == "CALL_STARTED":
+    def render_line(ev):
+        stamp = dt_to_iso(iso_to_dt(ev.get("ts")))
+        if ev["type"] == "CALL_STARTED":
             return f"{stamp} Customer connected the call."
-        if t == "AGENT_JOINED":
-            agent = ev.get("agent")
-            # First join → answered
-            if first_agent and agent == first_agent:
-                return f"{stamp} Agent {agent} answered."
-            return f"{stamp} Agent {agent} joined the call"
-        if t == "TRANSFER_COMPLETED":
-            return f"{stamp} Agent {ev.get('from')} transferred the call to Agent {ev.get('to')}"
-        if t == "AGENT_LEFT":
-            return f"{stamp} Agent {ev.get('agent')} left the call"
-        if t == "CALL_ENDED":
-            reason = ev.get("reason") or "UNKNOWN"
-            return f"{stamp} Primary call ended and was disconnect by {reason}"
+        if ev["type"] == "AGENT_JOINED":
+            if ev["agent"] == first_agent:
+                return f"{stamp} Agent {ev['agent']} answered."
+            return f"{stamp} Agent {ev['agent']} joined the call"
+        if ev["type"] == "TRANSFER_COMPLETED":
+            return f"{stamp} Agent {ev['from']} transferred the call to Agent {ev['to']}"
+        if ev["type"] == "AGENT_LEFT":
+            return f"{stamp} Agent {ev['agent']} left the call"
+        if ev["type"] == "CALL_ENDED":
+            return f"{stamp} Primary call ended and was disconnect by {ev.get('reason', 'UNKNOWN')}"
         return None
 
-    text_lines: List[str] = []
-    text_lines.append("Call Summary:\n")
     for ev in events:
         line = render_line(ev)
         if line:
             text_lines.append(line)
 
-    if recording_urls:
-        text_lines.append("\nRecording Links:")
-        for u in recording_urls:
-            # sample value of u: amazon-connect-d95997315caa/connect/xoriant-dev/CallRecordings/2026/02/02/26e3c0f7-d6e4-41c4-a906-4eddcbe52c86_20260202T17:12_UTC.wav
-            bucket_name = u.split('/')[0]
-            file_key = u.split(bucket_name + '/')[1]
-            recording_url = SALESFORCE_S3_PRESIGNED_BASE_URL + 'fileKey=' + file_key + '&bucket=' + bucket_name
-            text_lines.append(f"- {recording_url}")
-
     text_lines.append("\n\nTask Forms Summary:\n")
-    for i, agent in agents.items():
+    for name, agent in agents.items():
         if agent.get("TaskFormId"):
-            task_form_url = SALESFORCE_TASK_BASE_URL + agent['TaskFormId'] + '/view'
-            text_lines.append(f" Task form filled by Agent, {i}: {task_form_url}")
+            text_lines.append(
+                f" Task form filled by Agent, {name}: {SALESFORCE_TASK_BASE_URL}{agent['TaskFormId']}/view"
+            )
         else:
-            text_lines.append(f" Task form not filled by Agent, {i}")
+            text_lines.append(f" Task form not filled by Agent, {name}")
 
-    # Compose final text block (what we'll post as CaseComment)
-    timeline_text_block = "\n".join(text_lines)
-
-    # Pack
-    result = {
+    return {
         "meta": {
             "rootContactId": root_id,
-            "caseId": case_id,
+            "caseIds": case_ids,
             "customerEndpoint": customer_endpoint,
-            "initialQueue": initial_queue,
-            "recordingUrls": recording_urls
+            "initialQueue": initial_queue
         },
-        "timeline": events,
-        "timelineText": text_lines,
-        "timelineTextBlock": timeline_text_block
-    }
-    return result
-
-# -----------------------------
-# Salesforce CaseComment poster
-# -----------------------------
-
-def post_case_comment(case_id: str, comment_body: str) -> Dict[str, Any]:
-    """
-    Create a Salesforce CaseComment with the given body.
-    Uses shared get_access_token() for auth.
-    """
-    token_res = get_access_token()
-    comment_url = f"{token_res['instance_url']}/services/data/v59.0/sobjects/CaseComment"
-
-    payload = {
-        "ParentId": case_id,
-        "CommentBody": comment_body,
-        "IsPublished": False  # internal; set True to expose to customers
+        "timelineTextBlock": "\n".join(text_lines)
     }
 
+# -----------------------------
+# Salesforce API
+# -----------------------------
+
+def post_case_comment(case_id: str, comment_body: str):
+    token = get_access_token()
+    url = f"{token['instance_url']}/services/data/v59.0/sobjects/CaseComment"
     resp = requests.post(
-        comment_url,
+        url,
         headers={
-            "Authorization": f"Bearer {token_res['access_token']}",
-            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token['access_token']}",
+            "Content-Type": "application/json"
         },
-        json=payload,
+        json={"ParentId": case_id, "CommentBody": comment_body, "IsPublished": False},
         timeout=20,
     )
-
     if resp.status_code not in (200, 201):
-        raise RuntimeError(f"Failed to create CaseComment: {resp.status_code} - {resp.text}")
-
+        raise RuntimeError(resp.text)
     return resp.json()
 
 # -----------------------------
@@ -341,86 +277,32 @@ def post_case_comment(case_id: str, comment_body: str) -> Dict[str, Any]:
 # -----------------------------
 
 def lambda_handler(event, context):
-    """
-    Expected event:
-    {
-      "rootContactId": "<UUID>"
-    }
-
-    Behavior:
-    - Read the ConnectCallTimeline item
-    - Build human-readable timeline (sorted)
-    - Post as CaseComment to Salesforce
-    - Return JSON with outcome and the same timeline text
-    """
-    # Log the event for traceability
-    try:
-        print("[EVENT] ", json.dumps(event, default=str))
-    except Exception:
-        print("[EVENT] <unprintable>")
-
-    # Parse the input
-    try:
-        if isinstance(event, str):
-            event = json.loads(event)
-    except Exception:
-        pass
 
     root_id = event.get("rootContactId") or event.get("RootContactId")
     if not root_id:
-        msg = "Missing rootContactId in input"
-        print(f"[ERROR] {msg}")
-        return {"statusCode": 400, "body": json.dumps({"error": msg})}
+        return {"statusCode": 400, "body": "Missing rootContactId"}
 
-    # Read the timeline item
     resp = TABLE.get_item(Key={"RootContactId": root_id}, ConsistentRead=True)
-    item = resp.get("Item")
-    if not item:
-        msg = f"RootContactId '{root_id}' not found"
-        print(f"[ERROR] {msg}")
-        return {"statusCode": 404, "body": json.dumps({"error": msg})}
+    if "Item" not in resp:
+        return {"statusCode": 404, "body": "Item not found"}
 
-    native = to_native(item)
-    result = build_timeline_payload(native)
+    result = build_timeline_payload(to_native(resp["Item"]))
 
-    # Pretty print to logs (useful for audits)
-    print("=" * 80)
-    print(f"[TIMELINE RESULT] RootContactId={root_id}")
-    print("-" * 80)
-    try:
-        print(json.dumps(result, indent=2, sort_keys=False, default=str))
-    except Exception as e:
-        print(f"[WARN] Could not pretty-print result: {e}")
-        print(str(result))
-    print("=" * 80)
-    print(result.get("timelineTextBlock", ""))
+    posted = []
+    failed = []
 
-    # Post to Salesforce CaseComment
-    case_id = result["meta"].get("caseId")
-    if not case_id:
-        msg = f"No CaseId present for RootContactId={root_id}; cannot post CaseComment."
-        print(f"[ERROR] {msg}")
-        return {"statusCode": 409, "body": json.dumps({"error": msg, "timelineTextBlock": result.get('timelineTextBlock')})}
+    for case_id in result["meta"]["caseIds"]:
+        try:
+            post_case_comment(case_id, result["timelineTextBlock"])
+            posted.append(case_id)
+        except Exception as e:
+            failed.append({"caseId": case_id, "error": str(e)})
 
-    try:
-        sf_res = post_case_comment(case_id, result["timelineTextBlock"])
-        print(f"[SF] CaseComment created on Case {case_id}: {sf_res}")
-        body = {
-            "message": "Timeline posted to Salesforce CaseComment",
-            "caseId": case_id,
+    return {
+        "statusCode": 200 if posted else 207,
+        "body": json.dumps({
             "rootContactId": root_id,
-            "salesforceResult": sf_res,
-            "timelineTextBlock": result["timelineTextBlock"]
-        }
-        return {"statusCode": 200, "body": json.dumps(body)}
-    except Exception as e:
-        print(f"[ERROR] Failed to post CaseComment for Case {case_id}: {e}")
-        return {
-            "statusCode": 502,
-            "body": json.dumps({
-                "error": str(e),
-                "caseId": case_id,
-                "rootContactId": root_id,
-                "timelineTextBlock": result.get("timelineTextBlock")
-            })
-        }
+            "postedCases": posted,
+            "failedCases": failed
+        })
+    }
