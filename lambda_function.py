@@ -2,11 +2,18 @@
 # --------------------------------------
 # - Reads a call summary from DynamoDB (ConnectCallTimeline) by RootContactId
 # - Builds a human-readable timeline (sorted ascending)
-# - Posts the timeline as Salesforce CaseComment(s) using shared auth
+# - Posts the timeline as a Salesforce CaseComment using shared auth
 #
-# ✅ UPDATED:
-# - CaseId now exists under Agents
-# - Summary posted once per UNIQUE CaseId
+# Event (recommended):
+#   { "rootContactId": "<UUID>" }
+#
+# Env Vars:
+#   TIMELINE_TABLE=ConnectCallTimeline
+#   OUTPUT_TZ=Asia/Kolkata   (optional, default)
+#   SHOW_UTC=false           (optional; 'true' appends UTC time)
+#
+# Requires:
+#   from common.sf_auth import get_access_token
 
 import json
 import os
@@ -18,6 +25,7 @@ import boto3
 from boto3.dynamodb.types import TypeDeserializer
 import requests
 
+# ---- Shared Salesforce auth (your existing utility) ----
 from common.sf_auth import get_access_token
 
 # ---- AWS resources ----
@@ -36,7 +44,7 @@ SALESFORCE_S3_PRESIGNED_BASE_URL = os.environ.get(
 _deser = TypeDeserializer()
 
 # -----------------------------
-# Utilities (UNCHANGED)
+# Utilities
 # -----------------------------
 
 def iso_to_dt(s: Optional[str]) -> Optional[datetime]:
@@ -49,12 +57,10 @@ def iso_to_dt(s: Optional[str]) -> Optional[datetime]:
     except Exception:
         return None
 
-
 def dt_to_iso(dt: Optional[datetime]) -> Optional[str]:
     if not dt:
         return None
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
 
 def is_attrvalue_item(item: Dict[str, Any]) -> bool:
     for v in item.values():
@@ -62,12 +68,10 @@ def is_attrvalue_item(item: Dict[str, Any]) -> bool:
             return True
     return False
 
-
 def to_native(item: Dict[str, Any]) -> Dict[str, Any]:
     if not item or not is_attrvalue_item(item):
         return item
-    return {k: _deser.deserialize(v) for k, v in item.items()}
-
+    return { k: _deser.deserialize(v) for k, v in item.items() }
 
 def safe_get(d: Dict[str, Any], *path, default=None):
     cur = d
@@ -76,7 +80,6 @@ def safe_get(d: Dict[str, Any], *path, default=None):
             return default
         cur = cur[p]
     return cur
-
 
 def fmt_time_local(dt: datetime, tz: ZoneInfo, show_utc: bool) -> str:
     if not isinstance(dt, datetime):
@@ -88,20 +91,38 @@ def fmt_time_local(dt: datetime, tz: ZoneInfo, show_utc: bool) -> str:
         return f"{s_local} ({s_utc})"
     return s_local
 
-
+# Event priority for tie-breaking (same-second events)
 _EVENT_ORDER = {
-    "CALL_STARTED": 10,
-    "AGENT_JOINED": 20,
+    "CALL_STARTED"      : 10,
+    "AGENT_JOINED"      : 20,
     "TRANSFER_COMPLETED": 30,
-    "AGENT_LEFT": 40,
-    "CALL_ENDED": 50,
+    "AGENT_LEFT"        : 40,
+    "CALL_ENDED"        : 50,
 }
 
 # -----------------------------
-# Timeline builder
+# Timeline builder (from the ConnectCallTimeline item)
 # -----------------------------
 
 def build_timeline_payload(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build both structured timeline AND human-readable text block in the format you asked:
+
+    Call Summary:
+
+    18:08:40 Customer connected the call.
+    18:09:34 Agent Mohammed-Siddiqui answered.
+    18:09:54 Agent Mohammed-Siddiqui transferred the call to Agent aman.singh
+    18:10:14 Agent aman.singh joined the call
+    18:11:00 Agent Mohammed-Siddiqui left the call
+    18:11:44 Agent aman.singh left the call
+    18:11:53 Primary call ended and was disconnect by CUSTOMER_DISCONNECT
+
+    Recording Links:
+    - <url>
+    """
+
+    # Output formatting config
 
     tz_name = os.environ.get("OUTPUT_TZ", "Asia/Kolkata")
     show_utc = os.environ.get("SHOW_UTC", "false").lower() in ("1", "true", "yes")
@@ -110,14 +131,14 @@ def build_timeline_payload(item: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         tz = ZoneInfo("UTC")
 
-    root_id: str = item.get("RootContactId")
-    call_started = item.get("CallStartedTs")
-    call_ended = item.get("CallEndedTs")
+    root_id: str    = item.get("RootContactId")
+    call_started    = item.get("CallStartedTs")
+    call_ended      = item.get("CallEndedTs")
 
     legs = item.get("ContactLegs", {}) or {}
     agents = item.get("Agents", {}) or {}
 
-    # ✅ NEW: Collect CaseIds from agents
+    #Collect CaseIds from agents
     case_ids: List[str] = []
     for _, agent in agents.items():
         cid = agent.get("CaseId")
@@ -131,14 +152,17 @@ def build_timeline_payload(item: Dict[str, Any]) -> Dict[str, Any]:
     inbound_agent = root_leg.get("AgentUsername")
     inbound_transfer_ts = iso_to_dt(root_leg.get("TransferCompletedTimestamp"))
 
+    # Earliest agent to join (for “answered” phrasing)
     first_agent, first_join_dt = None, None
     for a, info in agents.items():
         fj = iso_to_dt(info.get("firstJoin"))
         if fj and (first_join_dt is None or fj < first_join_dt):
             first_agent, first_join_dt = a, fj
 
+    # Transfer legs and chain
     transfer_legs = [(cid, l) for cid, l in legs.items() if l.get("InitiationMethod") == "TRANSFER"]
 
+    # Join chain (inbound → each transfer agent)
     chain: List[Tuple[str, datetime]] = []
     if inbound_agent:
         ia_first = iso_to_dt(safe_get(agents, inbound_agent, "firstJoin")) or iso_to_dt(call_started)
@@ -157,7 +181,7 @@ def build_timeline_payload(item: Dict[str, Any]) -> Dict[str, Any]:
 
     transfer_chain = []
     for i in range(1, len(chain)):
-        src = chain[i - 1][0]
+        src = chain[i-1][0]
         dst = chain[i][0]
         when = inbound_transfer_ts if (i == 1 and inbound_transfer_ts) else chain[i][1]
         transfer_chain.append({"from": src, "to": dst, "at": dt_to_iso(when)})
