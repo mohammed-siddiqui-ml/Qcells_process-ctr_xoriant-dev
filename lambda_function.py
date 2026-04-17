@@ -17,6 +17,7 @@
 
 import json
 import os
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Tuple
 from zoneinfo import ZoneInfo
@@ -27,6 +28,10 @@ import requests
 
 # ---- Shared Salesforce auth (your existing utility) ----
 from common.sf_auth import get_access_token
+
+# ---- Configure logging ----
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # ---- AWS resources ----
 DDB = boto3.resource("dynamodb")
@@ -257,52 +262,105 @@ def build_timeline_payload(item: Dict[str, Any]) -> Dict[str, Any]:
 # -----------------------------
 
 def post_case_comment(case_id: str, comment_body: str):
-    token = get_access_token()
+    logger.info(f"Starting post_case_comment for case_id: {case_id}")
+    
+    try:
+        logger.info("Retrieving Salesforce access token")
+        token = get_access_token()
+        logger.info(f"Successfully retrieved Salesforce token. Instance URL: {token['instance_url']}")
+    except Exception as e:
+        logger.error(f"Failed to retrieve Salesforce access token: {str(e)}", exc_info=True)
+        raise
+    
     url = f"{token['instance_url']}/services/data/v59.0/sobjects/CaseComment"
-    resp = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {token['access_token']}",
-            "Content-Type": "application/json"
-        },
-        json={"ParentId": case_id, "CommentBody": comment_body, "IsPublished": False},
-        timeout=20,
-    )
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(resp.text)
-    return resp.json()
+    logger.info(f"Posting CaseComment to Salesforce. URL: {url}")
+    logger.debug(f"Comment body length: {len(comment_body)} characters")
+    
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token['access_token']}",
+                "Content-Type": "application/json"
+            },
+            json={"ParentId": case_id, "CommentBody": comment_body, "IsPublished": False},
+            timeout=20,
+        )
+        logger.info(f"Salesforce CaseComment API response status: {resp.status_code}")
+        
+        if resp.status_code not in (200, 201):
+            logger.error(f"Salesforce API returned error status {resp.status_code}: {resp.text}")
+            raise RuntimeError(resp.text)
+        
+        logger.info(f"Successfully posted CaseComment for case_id: {case_id}")
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request failed while posting CaseComment for case_id {case_id}: {str(e)}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error posting CaseComment for case_id {case_id}: {str(e)}", exc_info=True)
+        raise
 
 # -----------------------------
 # Lambda handler
 # -----------------------------
 
 def lambda_handler(event, context):
-
+    logger.info(f"Lambda handler invoked with event: {json.dumps(event)}")
+    
     root_id = event.get("rootContactId") or event.get("RootContactId")
     if not root_id:
+        logger.warning("Missing rootContactId in event")
         return {"statusCode": 400, "body": "Missing rootContactId"}
+    
+    logger.info(f"Processing call timeline for RootContactId: {root_id}")
 
-    resp = TABLE.get_item(Key={"RootContactId": root_id}, ConsistentRead=True)
-    if "Item" not in resp:
-        return {"statusCode": 404, "body": "Item not found"}
+    try:
+        logger.info(f"Querying DynamoDB table '{os.environ.get('TIMELINE_TABLE', 'ConnectCallTimeline')}' for RootContactId: {root_id}")
+        resp = TABLE.get_item(Key={"RootContactId": root_id}, ConsistentRead=True)
+        
+        if "Item" not in resp:
+            logger.warning(f"No item found in DynamoDB for RootContactId: {root_id}")
+            return {"statusCode": 404, "body": "Item not found"}
+        
+        logger.info(f"Successfully retrieved item from DynamoDB for RootContactId: {root_id}")
+    except Exception as e:
+        logger.error(f"DynamoDB query failed for RootContactId {root_id}: {str(e)}", exc_info=True)
+        raise
 
-    result = build_timeline_payload(to_native(resp["Item"]))
+    try:
+        logger.info(f"Building timeline payload for RootContactId: {root_id}")
+        result = build_timeline_payload(to_native(resp["Item"]))
+        logger.info(f"Timeline built successfully. Case IDs to post to: {result['meta']['caseIds']}")
+    except Exception as e:
+        logger.error(f"Failed to build timeline payload for RootContactId {root_id}: {str(e)}", exc_info=True)
+        raise
 
     posted = []
     failed = []
 
+    logger.info(f"Starting to post case comments for {len(result['meta']['caseIds'])} case(s)")
     for case_id in result["meta"]["caseIds"]:
         try:
+            logger.info(f"Posting case comment for case_id: {case_id}")
             post_case_comment(case_id, result["timelineTextBlock"])
             posted.append(case_id)
+            logger.info(f"Successfully posted case comment for case_id: {case_id}")
         except Exception as e:
+            logger.error(f"Failed to post case comment for case_id {case_id}: {str(e)}", exc_info=True)
             failed.append({"caseId": case_id, "error": str(e)})
 
+    response_body = {
+        "rootContactId": root_id,
+        "postedCases": posted,
+        "failedCases": failed
+    }
+    
+    status_code = 200 if posted else 207
+    logger.info(f"Lambda execution completed. Status: {status_code}. Posted: {len(posted)}, Failed: {len(failed)}")
+    logger.info(f"Response: {json.dumps(response_body)}")
+    
     return {
-        "statusCode": 200 if posted else 207,
-        "body": json.dumps({
-            "rootContactId": root_id,
-            "postedCases": posted,
-            "failedCases": failed
-        })
+        "statusCode": status_code,
+        "body": json.dumps(response_body)
     }
